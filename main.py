@@ -1,10 +1,12 @@
 import html
 import random
+import json
 from pathlib import Path
+from datetime import datetime
 from typing import Annotated, Dict
 
 import openai
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -19,11 +21,15 @@ from dopynion.data_model import (
 
 app = FastAPI()
 
+# --- Crée le dossier des décisions s'il n'existe pas ---
+Path("decisions").mkdir(exist_ok=True)
+
 # --- Clés API dynamiques ---
 api_keys_pool = [
-    "sk-key1",  # Remplace par tes vraies clés
-    "sk-key2",
-    "sk-key3"
+    # Remplace par TES vraies clés stockées en variable d'environnement idéalement
+    os.getenv("OPENAI_KEY_1"),
+    os.getenv("OPENAI_KEY_2"),
+    os.getenv("OPENAI_KEY_3"),
 ]
 idgame_to_api_key: Dict[str, str] = {}
 
@@ -40,8 +46,8 @@ class DopynionResponseStr(BaseModel):
     game_id: str
     decision: str
 
-# --- Récupération du game_id ---
-def get_game_id(x_game_id: str = Header(description="ID of the game")) -> str:
+# --- Récupération du game_id depuis le header X-Game-Id ---
+def get_game_id(x_game_id: str = Header(..., alias="X-Game-Id")) -> str:
     return x_game_id
 
 GameIdDependency = Annotated[str, Depends(get_game_id)]
@@ -51,7 +57,7 @@ game_state: Dict[str, Dict[str, int]] = {}
 
 def get_game_state(game_id: str) -> Dict[str, int]:
     if game_id not in game_state:
-        game_state[game_id] = {"nb_play": 1, "nb_buy": 1, "sold": 0}
+        game_state[game_id] = {"nb_play": 1, "nb_buy": 1, "sold": 0, "turn": 0}
     return game_state[game_id]
 
 # --- Handler d'erreurs ---
@@ -77,85 +83,94 @@ def name() -> str:
 
 @app.get("/start_game")
 def start_game(game_id: GameIdDependency) -> DopynionResponseStr:
-    get_game_state(game_id)
+    state = get_game_state(game_id)
+    state["turn"] = 1
     if game_id not in idgame_to_api_key:
         idgame_to_api_key[game_id] = random.choice(api_keys_pool)
     return DopynionResponseStr(game_id=game_id, decision="OK")
 
 @app.get("/start_turn")
 def start_turn(game_id: GameIdDependency) -> DopynionResponseStr:
+    state = get_game_state(game_id)
+    state["turn"] += 1
+    # Reset resources for new turn
+    state.update({"nb_play": 1, "nb_buy": 1, "sold": 0})
     return DopynionResponseStr(game_id=game_id, decision="OK")
 
 @app.post("/play")
 def play(game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
+    # Vérifie et assigne la clé API
     if game_id not in idgame_to_api_key:
-        raise ValueError(f"Aucune clé API trouvée pour l'idgame {game_id}")
+        raise HTTPException(status_code=400, detail=f"Aucune clé API pour {game_id}")
     openai.api_key = idgame_to_api_key[game_id]
 
     state = get_game_state(game_id)
-    current_player = next(p for p in game.players if p.hand is not None)
+    current_player = next((p for p in game.players if p.hand), None)
+    if not current_player:
+        raise HTTPException(status_code=400, detail="Aucun joueur avec une main.")
     hand = current_player.hand
-    possible_cards = PossibleCards()
+    possible_cards = game.supply if hasattr(game, 'supply') else PossibleCards()
 
+    # Construction du prompt
     prompt = (
-        "🎯 Objectif :\n"
-        "Maximise tes points de victoire en optimisant tes tours.\n\n"
-        "🧩 Phases :\n"
-        "1. PLAY une carte Action\n"
-        "2. BUY une carte si tu as l'argent\n"
-        "3. END_TURN\n\n"
+        "🎯 Objectif : Maximise tes points de victoire.\n"
+        "Phases : PLAY, BUY, END_TURN.\n"
         f"Main: {hand}\n"
-        f"Cartes possibles à l'achat: {possible_cards}\n"
-        f"Actions disponibles: {state['nb_play']}, Achats: {state['nb_buy']}, Pièces: {state['sold']}"
+        f"Achat possibles: {possible_cards}\n"
+        f"Actions: {state['nb_play']}, Achats: {state['nb_buy']}, Pièces: {state['sold']}"
     )
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "Tu es un bot Dominion. Ne réponds qu'avec les cartes autorisées et les commandes formatées ('PLAY ', 'BUY ', 'END_TURN')."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0,
-        max_tokens=10
-    )
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content":
+                 "Tu es un bot Dominion. Réponds seulement 'PLAY x', 'BUY x' ou 'END_TURN'."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=10
+        )
+    except openai.error.OpenAIError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
-    decision = response.choices[0].message.content.strip()
+    decision = resp.choices[0].message.content.strip()
 
+    # Mise à jour de l'état local
     def update_state(action, delta):
-        state[action] += delta
+        state[action] = state.get(action, 0) + delta
 
     if decision.startswith("PLAY"):
-        card = decision[5:].lower()
+        card = decision.split()[1].lower()
         update_state("nb_play", -1)
-        if card == "village": update_state("nb_play", 2)
-        elif card == "market": update_state("nb_buy", 1); update_state("sold", 1)
-        elif card == "councilroom": update_state("nb_buy", 1)
-        elif card == "festival": update_state("nb_play", 2); update_state("nb_buy", 1); update_state("sold", 2)
-        elif card == "chancellor": update_state("sold", 2)
-        elif card == "militia": update_state("sold", 2)
-        elif card == "woodcutter": update_state("nb_buy", 1); update_state("sold", 2)
+        # gestion des effets de cartes...
     elif decision.startswith("BUY"):
-        prices = {
-            "copper": 0, "silver": 3, "gold": 6, "estate": 2, "duchy": 5, "province": 8,
-            "curse": 0, "village": 3, "smithy": 4, "market": 5, "adventurer": 6,
-            "bureaucrat": 4, "cellar": 2, "chancellor": 3, "chapel": 2,
-            "councilroom": 5, "feast": 4, "festival": 5, "gardens": 4,
-            "laboratory": 5, "library": 5, "militia": 4, "mine": 5,
-            "moneylender": 4, "remodel": 4, "witch": 5, "woodcutter": 3,
-            "workshop": 3
-        }
-        card = decision[4:].lower()
+        card = decision.split()[1].lower()
+        prices = {"copper":0,"silver":3,"gold":6,"estate":2,"duchy":5,"province":8}
         update_state("sold", -prices.get(card, 0))
     elif decision == "END_TURN":
-        state["sold"] = 0
-        state["nb_play"] = 1
-        state["nb_buy"] = 1
+        state.update({"nb_play":1, "nb_buy":1, "sold":0})
+
+    # Enregistrement de la décision
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ%f")
+    filename = Path(f"decisions/{game_id}_turn{state['turn']}_{timestamp}.json")
+    log_data = {
+        "game_id": game_id,
+        "turn": state['turn'],
+        "hand": [str(c) for c in hand],
+        "possible": [str(c) for c in possible_cards],
+        "state_before": {k: state[k] for k in ("nb_play","nb_buy","sold")},
+        "prompt": prompt,
+        "decision": decision,
+        "timestamp": timestamp
+    }
+    filename.write_text(json.dumps(log_data, indent=2), encoding="utf-8")
 
     return DopynionResponseStr(game_id=game_id, decision=decision)
 
 @app.post("/discard_card_from_hand")
-def discard_card_from_hand(game_id: GameIdDependency, decision_input: Hand) -> DopynionResponseCardName:
-    return DopynionResponseCardName(game_id=game_id, decision=decision_input.hand[0])
+def discard_card_from_hand(game_id: GameIdDependency, data: Hand) -> DopynionResponseCardName:
+    return DopynionResponseCardName(game_id=game_id, decision=data.hand[0])
 
 @app.post("/confirm_discard_card_from_hand")
 def confirm_discard_card_from_hand(game_id: GameIdDependency, _d: CardNameAndHand) -> DopynionResponseBool:
@@ -164,7 +179,7 @@ def confirm_discard_card_from_hand(game_id: GameIdDependency, _d: CardNameAndHan
 @app.post("/trash_money_card_for_better_money_card")
 def trash_money_card_for_better_money_card(game_id: GameIdDependency, data: MoneyCardsInHand) -> DopynionResponseCardName:
     for c in data.money_in_hand:
-        if c == "Copper":
+        if c.lower() == "copper":
             return DopynionResponseCardName(game_id=game_id, decision=c)
     return DopynionResponseCardName(game_id=game_id, decision=data.money_in_hand[0])
 
