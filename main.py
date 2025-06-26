@@ -183,12 +183,14 @@ def play(_game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
         if action_possible_this_turn.get(game_id, 0) >= 1:
             if card_in_deck(hand, "fairgrounds") == True: # Exemple : si pas assez de copper pour Gold, achète un Silver si possible
                 decision = "ACTION fairgrounds"
-                purchases_possible_this_turn[game_id] -= 1
+                action_possible_this_turn[game_id] -= 1
                 print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")            
-            if card_in_deck(hand, "smithy"):
+            elif card_in_deck(hand, "smithy"):
                 decision = "ACTION smithy"
-                purchases_possible_this_turn[game_id] -= 1
-                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")  
+                action_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")
+            elif card_in_deck(hand, "magpie") == True: 
+                decision = "ACTION magpie"
         elif purchases_possible_this_turn.get(game_id, 0) >= 1: # Vérifie si un achat peut être fait ce tour
             if money_in_hand >= 11 and card_in_deck(_game.stock, "colony") == True: # Exemple : si pas assez de copper pour Colonnie, achète un Silver si possible
                 decision = "BUY colony"
@@ -210,6 +212,9 @@ def play(_game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
                 decision = "BUY gold"
                 purchases_possible_this_turn[game_id] -= 1
                 print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            elif money_in_hand >= 5 and card_in_deck(_game.stock, "magpie") == True: # Exemple : si pas assez de copper pour Duchy, achète un Silver si possible
+                decision = "BUY magpie"
+                purchases_possible_this_turn[game_id] -= 1            
             elif money_in_hand >= 4 and card_in_deck(_game.stock, "smithy") == True: # Exemple : si pas assez de copper pour Duchy, achète un Silver si possible
                 decision = "BUY smithy"
                 purchases_possible_this_turn[game_id] -= 1
