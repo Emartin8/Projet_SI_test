@@ -191,6 +191,7 @@ def play(_game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
                 print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")
             elif card_in_deck(hand, "magpie") == True: 
                 decision = "ACTION magpie"
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")
         elif purchases_possible_this_turn.get(game_id, 0) >= 1: # Vérifie si un achat peut être fait ce tour
             if money_in_hand >= 11 and card_in_deck(_game.stock, "colony") == True: # Exemple : si pas assez de copper pour Colonnie, achète un Silver si possible
                 decision = "BUY colony"
