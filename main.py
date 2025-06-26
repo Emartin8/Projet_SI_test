@@ -180,6 +180,7 @@ def play(_game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
         decision = "END_TURN" # Décision par défaut si aucun achat n'est fait
 
         # --- Logique pour la contrainte d'un achat par tour ---
+        print(f"Tour {current_turn}. Actions possibles : {action_possible_this_turn.get(game_id, 0)}. Achats possible : {purchases_possible_this_turn.get(game_id, 0)}")
         if action_possible_this_turn.get(game_id, 0) >= 1:
             if card_in_deck(hand, "fairgrounds") == True: # Exemple : si pas assez de copper pour Gold, achète un Silver si possible
                 decision = "ACTION fairgrounds"
