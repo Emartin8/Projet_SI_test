@@ -116,7 +116,7 @@ def root() -> str:
 
 @app.get("/name")
 def name() -> str:
-    return "Les Variables"
+    return "Les Variables 2"
 
 
 @app.get("/start_game")
