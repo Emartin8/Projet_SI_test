@@ -1,14 +1,6 @@
 import html
-import random
-import json
 from pathlib import Path
-from datetime import datetime
 from typing import Annotated, Dict
-
-import openai
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
 
 from dopynion.data_model import (
     CardName,
@@ -17,186 +9,294 @@ from dopynion.data_model import (
     Hand,
     MoneyCardsInHand,
     PossibleCards,
+    Cards,
+    Player,
 )
+from fastapi import Depends, FastAPI, Header, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+
 
 app = FastAPI()
 
-# --- Crée le dossier des décisions s'il n'existe pas ---
-Path("decisions").mkdir(exist_ok=True)
+#####################################################
+# Gestion des numéros de tour par partie
+#####################################################
 
-# --- Clés API dynamiques ---
-api_keys_pool = [
-    # Remplace par TES vraies clés stockées en variable d'environnement idéalement
-    os.getenv("OPENAI_KEY_1"),
-    os.getenv("OPENAI_KEY_2"),
-    os.getenv("OPENAI_KEY_3"),
-]
-idgame_to_api_key: Dict[str, str] = {}
+# Dictionnaire pour stocker le numéro de tour pour chaque GameID
+game_turn_numbers: Dict[str, int] = {}
+# Dictionnaire pour suivre si un achat et une action ont été fait ce tour pour chaque partie
+purchases_possible_this_turn: Dict[str, int] = {}
+action_possible_this_turn: Dict[str, int] = {}
 
-# --- Modèles de réponse ---
+#####################################################
+# Data model for responses
+#####################################################
+
+
 class DopynionResponseBool(BaseModel):
     game_id: str
     decision: bool
+
 
 class DopynionResponseCardName(BaseModel):
     game_id: str
     decision: CardName
 
+
 class DopynionResponseStr(BaseModel):
     game_id: str
     decision: str
 
-# --- Récupération du game_id depuis le header X-Game-Id ---
-def get_game_id(x_game_id: str = Header(..., alias="X-Game-Id")) -> str:
+
+#####################################################
+# Getter for the game identifier
+#####################################################
+
+# --- Définition des valeurs monétaires des cartes ---
+MONEY_CARD_VALUES = {
+    "copper": 1,
+    "silver": 2,
+    "gold": 3,
+    "platinum": 5,
+    #"cursedgold": 3,
+    # Ajoutez ici d'autres cartes d'argent si votre jeu en contient
+}
+
+def get_game_id(x_game_id: str = Header(description="ID of the game")) -> str:
     return x_game_id
+
 
 GameIdDependency = Annotated[str, Depends(get_game_id)]
 
-# --- Gestion d'état par partie ---
-game_state: Dict[str, Dict[str, int]] = {}
 
-def get_game_state(game_id: str) -> Dict[str, int]:
-    if game_id not in game_state:
-        game_state[game_id] = {"nb_play": 1, "nb_buy": 1, "sold": 0, "turn": 0}
-    return game_state[game_id]
+#####################################################
+# error management
+#####################################################
 
-# --- Handler d'erreurs ---
+
 @app.exception_handler(Exception)
 def unknown_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    print(f"ERREUR INCONNUE: {exc.__class__.__name__} - Détail: {str(exc)}")
     return JSONResponse(
         status_code=500,
-        content={"message": "Oops!", "detail": str(exc), "name": exc.__class__.__name__},
+        content={
+            "message": "Oops!",
+            "detail": str(exc),
+            "name": exc.__class__.__name__,
+        },
     )
 
+
+#####################################################
+# Template extra bonus
+#####################################################
+
+
+# The root of the website shows the code of the website
 @app.get("/", response_class=HTMLResponse)
 def root() -> str:
     header = (
-        "<html><head><title>Dopynion with GPT</title></head><body>"
-        "<h1>GPT-driven Dominion Bot</h1><p><a href='/docs'>API Docs</a></p><pre>"
+        "<html><head><title>Dopynion template</title></head><body>"
+        "<h1>Dopynion documentation</h1>"
+        "<h2>API documentation</h2>"
+        '<p><a href="/docs">Read the documentation.</a></p>'
+        "<h2>Code template</h2>"
+        "<p>The code of this website is:</p>"
+        "<pre>"
     )
     footer = "</pre></body></html>"
     return header + html.escape(Path(__file__).read_text(encoding="utf-8")) + footer
 
+
+#####################################################
+# The code of the strategy
+#####################################################
+
+
 @app.get("/name")
 def name() -> str:
-    return "Les variables"
+    return "Les Variables"
+
 
 @app.get("/start_game")
 def start_game(game_id: GameIdDependency) -> DopynionResponseStr:
-    state = get_game_state(game_id)
-    state["turn"] = 1
-    if game_id not in idgame_to_api_key:
-        idgame_to_api_key[game_id] = random.choice(api_keys_pool)
+    # Initialise le numéro de tour pour cette partie à 0
+    game_turn_numbers[game_id] = 0
+    print(f"Game ID: {game_id} - DÉBUT PARTIE : Numéro de tour initialisé à 0. Achat réinitialisé.")
     return DopynionResponseStr(game_id=game_id, decision="OK")
+
 
 @app.get("/start_turn")
 def start_turn(game_id: GameIdDependency) -> DopynionResponseStr:
-    state = get_game_state(game_id)
-    state["turn"] += 1
-    # Reset resources for new turn
-    state.update({"nb_play": 1, "nb_buy": 1, "sold": 0})
+    # Incrémente le numéro de tour pour cette partie
+    game_turn_numbers[game_id] = game_turn_numbers.get(game_id, 0) + 1
+    current_turn = game_turn_numbers[game_id]
+    # Réinitialise l'état d'achat pour le nouveau tour
+    purchases_possible_this_turn[game_id] = 1
+    action_possible_this_turn[game_id] = 1
+    print(f"Game ID: {game_id} - TOUR {current_turn} - START_TURN: Arbitre a envoyé pour start_turn. Achat réinitialisé pour ce tour.")
     return DopynionResponseStr(game_id=game_id, decision="OK")
 
+
+def count_money_in_cards(cards: Cards) -> int:
+    total_money = 0
+    for card_name, quantity in cards.quantities.items():
+        if card_name in MONEY_CARD_VALUES:
+            total_money += MONEY_CARD_VALUES[card_name] * quantity
+    return total_money
+
+def card_in_deck(deck_cards_object: Cards, card_choice: str) -> bool:
+    if not deck_cards_object or not deck_cards_object.quantities:
+        return False
+    # Parcourt les cartes dans l'objet Cards
+    for card_name_in_deck, quantity in deck_cards_object.quantities.items():
+        # Comparaison directe du nom de la carte et de la quantité
+        if str(card_name_in_deck) == card_choice and quantity > 0:
+            return True
+    return False
+    
 @app.post("/play")
-def play(game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
-    # Vérifie et assigne la clé API
-    if game_id not in idgame_to_api_key:
-        raise HTTPException(status_code=400, detail=f"Aucune clé API pour {game_id}")
-    openai.api_key = idgame_to_api_key[game_id]
+def play(_game: Game, game_id: GameIdDependency) -> DopynionResponseStr:
+    current_turn = game_turn_numbers.get(game_id, 0) 
 
-    state = get_game_state(game_id)
-    current_player = next((p for p in game.players if p.hand), None)
+    # Trouver le joueur courant (celui qui a une main non nulle)
+    current_player = next((p for p in _game.players if p.hand is not None), None)
     if not current_player:
-        raise HTTPException(status_code=400, detail="Aucun joueur avec une main.")
-    hand = current_player.hand
-    possible_cards = game.supply if hasattr(game, 'supply') else PossibleCards()
+        print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - AVERTISSEMENT: Aucun joueur actif avec une main.")
+        raise HTTPException(status_code=400, detail="Aucun joueur actif avec une main.")
+    else:
+        # Accéder aux cartes de la main (c'est un objet Cards)
+        hand = current_player.hand 
+        print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - Main du joueur actuel: {hand.quantities} - SCORE = {current_player.score}")
+        
+        # Accéder aux quantités directement avec la chaîne "Copper"
+        nb_copper = hand.quantities.get("copper", 0) 
+        
+        # Compte l'argent disponible UNIQUEMENT dans la main du joueur
+        money_in_hand = count_money_in_cards(hand) 
+        print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - Argent disponible dans la main du joueur : {money_in_hand}") # Affiche ici
+        
+        decision = "END_TURN" # Décision par défaut si aucun achat n'est fait
 
-    # Construction du prompt
-    prompt = (
-        "🎯 Objectif : Maximise tes points de victoire.\n"
-        "Phases : PLAY, BUY, END_TURN.\n"
-        f"Main: {hand}\n"
-        f"Achat possibles: {possible_cards}\n"
-        f"Actions: {state['nb_play']}, Achats: {state['nb_buy']}, Pièces: {state['sold']}"
-    )
+        # --- Logique pour la contrainte d'un achat par tour ---
+        if action_possible_this_turn.get(game_id, 0) >= 1:
+            if card_in_deck(hand, "fairgrounds") == True: # Exemple : si pas assez de copper pour Gold, achète un Silver si possible
+                decision = "ACTION fairgrounds"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")            
+            if card_in_deck(hand, "smithy"):
+                decision = "ACTION smithy"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY EFFECTUÉ: {decision} - ACHAT ")  
+        elif purchases_possible_this_turn.get(game_id, 0) >= 1: # Vérifie si un achat peut être fait ce tour
+            if money_in_hand >= 11 and card_in_deck(_game.stock, "colony") == True: # Exemple : si pas assez de copper pour Colonnie, achète un Silver si possible
+                decision = "BUY colony"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            elif money_in_hand >= 9 and card_in_deck(_game.stock, "platinum") == True: # Exemple : si pas assez de copper pour Platine, achète un Silver si possible
+                decision = "BUY platinum"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            elif money_in_hand >= 8 and card_in_deck(_game.stock, "province") == True: # Exemple : si pas assez de copper pour Province, achète un Silver si possible
+                decision = "BUY province"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            elif money_in_hand >= 7 and card_in_deck(_game.stock, "fairgrounds") == True: # Exemple : si pas assez de copper pour Gold, achète un Silver si possible
+                decision = "BUY fairgrounds"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")            
+            elif money_in_hand >= 6 and card_in_deck(_game.stock, "gold") == True: # Exemple : si pas assez de copper pour Gold, achète un Silver si possible
+                decision = "BUY gold"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            elif money_in_hand >= 4 and card_in_deck(_game.stock, "smithy") == True: # Exemple : si pas assez de copper pour Duchy, achète un Silver si possible
+                decision = "BUY smithy"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            elif money_in_hand >= 3 and card_in_deck(_game.stock, "silver") == True: # Exemple : si pas assez de copper pour Estate, achète un Silver si possible
+                decision = "BUY silver"
+                purchases_possible_this_turn[game_id] -= 1
+                print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - ACHAT EFFECTUÉ: {decision}")
+            else:
+                decision = "END_TURN"
+        else:
+            print(f"Game ID: {game_id} - TOUR {current_turn} - PLAY - Un achat a déjà été effectué ce tour. Décision: {decision}")
+            decision = "END_TURN"
+        # -----------------------------------------------------------------
 
-    try:
-        resp = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content":
-                 "Tu es un bot Dominion. Réponds seulement 'PLAY x', 'BUY x' ou 'END_TURN'."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=10
-        )
-    except openai.error.OpenAIError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        return DopynionResponseStr(game_id=game_id, decision=decision)
 
-    decision = resp.choices[0].message.content.strip()
-
-    # Mise à jour de l'état local
-    def update_state(action, delta):
-        state[action] = state.get(action, 0) + delta
-
-    if decision.startswith("PLAY"):
-        card = decision.split()[1].lower()
-        update_state("nb_play", -1)
-        # gestion des effets de cartes...
-    elif decision.startswith("BUY"):
-        card = decision.split()[1].lower()
-        prices = {"copper":0,"silver":3,"gold":6,"estate":2,"duchy":5,"province":8}
-        update_state("sold", -prices.get(card, 0))
-    elif decision == "END_TURN":
-        state.update({"nb_play":1, "nb_buy":1, "sold":0})
-
-    # Enregistrement de la décision
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ%f")
-    filename = Path(f"decisions/{game_id}_turn{state['turn']}_{timestamp}.json")
-    log_data = {
-        "game_id": game_id,
-        "turn": state['turn'],
-        "hand": [str(c) for c in hand],
-        "possible": [str(c) for c in possible_cards],
-        "state_before": {k: state[k] for k in ("nb_play","nb_buy","sold")},
-        "prompt": prompt,
-        "decision": decision,
-        "timestamp": timestamp
-    }
-    filename.write_text(json.dumps(log_data, indent=2), encoding="utf-8")
-
-    return DopynionResponseStr(game_id=game_id, decision=decision)
-
-@app.post("/discard_card_from_hand")
-def discard_card_from_hand(game_id: GameIdDependency, data: Hand) -> DopynionResponseCardName:
-    return DopynionResponseCardName(game_id=game_id, decision=data.hand[0])
-
-@app.post("/confirm_discard_card_from_hand")
-def confirm_discard_card_from_hand(game_id: GameIdDependency, _d: CardNameAndHand) -> DopynionResponseBool:
-    return DopynionResponseBool(game_id=game_id, decision=True)
-
-@app.post("/trash_money_card_for_better_money_card")
-def trash_money_card_for_better_money_card(game_id: GameIdDependency, data: MoneyCardsInHand) -> DopynionResponseCardName:
-    for c in data.money_in_hand:
-        if c.lower() == "copper":
-            return DopynionResponseCardName(game_id=game_id, decision=c)
-    return DopynionResponseCardName(game_id=game_id, decision=data.money_in_hand[0])
-
-@app.post("/choose_card_to_receive_in_discard")
-def choose_card_to_receive_in_discard(game_id: GameIdDependency, data: PossibleCards) -> DopynionResponseCardName:
-    return DopynionResponseCardName(game_id=game_id, decision=data.possible_cards[0])
-
-@app.post("/skip_card_reception_in_hand")
-def skip_card_reception_in_hand(game_id: GameIdDependency, _d: CardNameAndHand) -> DopynionResponseBool:
-    return DopynionResponseBool(game_id=game_id, decision=True)
-
-@app.post("/confirm_discard_deck")
-def confirm_discard_deck(game_id: GameIdDependency) -> DopynionResponseBool:
-    return DopynionResponseBool(game_id=game_id, decision=True)
 
 @app.get("/end_game")
 def end_game(game_id: GameIdDependency) -> DopynionResponseStr:
-    game_state.pop(game_id, None)
-    idgame_to_api_key.pop(game_id, None)
+    # Supprime l'entrée du game_id des dictionnaires de suivi des tours et des achats
+    current_turn = game_turn_numbers.pop(game_id, 0) 
+    purchases_possible_this_turn.pop(game_id, None) # Nettoie l'état d'achat pour cette partie
+    print(f"Game ID: {game_id} - FIN PARTIE (Dernier tour enregistré: {current_turn}) : Partie terminée. États nettoyés.")
     return DopynionResponseStr(game_id=game_id, decision="OK")
+
+
+@app.post("/confirm_discard_card_from_hand")
+async def confirm_discard_card_from_hand(
+    game_id: GameIdDependency,
+    _decision_input: CardNameAndHand,
+) -> DopynionResponseBool:
+    current_turn = game_turn_numbers.get(game_id, 0)
+    print(f"Game ID: {game_id} - TOUR {current_turn} - CONFIRM_DISCARD_CARD_FROM_HAND: Décision input: {_decision_input.model_dump_json()}")
+    return DopynionResponseBool(game_id=game_id, decision=True)
+
+
+@app.post("/discard_card_from_hand")
+async def discard_card_from_hand(
+    game_id: GameIdDependency,
+    decision_input: Hand,
+) -> DopynionResponseCardName:
+    current_turn = game_turn_numbers.get(game_id, 0)
+    print(f"Game ID: {game_id} - TOUR {current_turn} - DISCARD_CARD_FROM_HAND: Main reçue: {decision_input.hand}")
+    return DopynionResponseCardName(game_id=game_id, decision=decision_input.hand[0])
+
+
+@app.post("/confirm_discard_deck")
+async def confirm_discard_deck(
+    game_id: GameIdDependency,
+) -> DopynionResponseBool:
+    current_turn = game_turn_numbers.get(game_id, 0)
+    print(f"Game ID: {game_id} - TOUR {current_turn} - CONFIRM_DISCARD_DECK:")
+    return DopynionResponseBool(game_id=game_id, decision=True)
+
+
+@app.post("/choose_card_to_receive_in_discard")
+async def choose_card_to_receive_in_discard(
+    game_id: GameIdDependency,
+    decision_input: PossibleCards,
+) -> DopynionResponseCardName:
+    current_turn = game_turn_numbers.get(game_id, 0)
+    print(f"Game ID: {game_id} - TOUR {current_turn} - CHOOSE_CARD_TO_RECEIVE_IN_DISCARD: Cartes possibles: {decision_input.possible_cards}")
+    return DopynionResponseCardName(
+        game_id=game_id,
+        decision=decision_input.possible_cards[0],
+    )
+
+
+@app.post("/skip_card_reception_in_hand")
+async def skip_card_reception_in_hand(
+    game_id: GameIdDependency,
+    _decision_input: CardNameAndHand,
+) -> DopynionResponseBool:
+    current_turn = game_turn_numbers.get(game_id, 0)
+    print(f"Game ID: {game_id} - TOUR {current_turn} - SKIP_CARD_RECEPTION_IN_HAND: Décision input: {_decision_input.model_dump_json()}")
+    return DopynionResponseBool(game_id=game_id, decision=True)
+
+
+@app.post("/trash_money_card_for_better_money_card")
+async def trash_money_card_for_better_money_card(
+    game_id: GameIdDependency,
+    decision_input: MoneyCardsInHand,
+) -> DopynionResponseCardName:
+    current_turn = game_turn_numbers.get(game_id, 0)
+    print(f"Game ID: {game_id} - TOUR {current_turn} - TRASH_MONEY_CARD_FOR_BETTER_MONEY_CARD: Cartes monnaie en main: {decision_input.money_in_hand}")
+    return DopynionResponseCardName(
+        game_id=game_id,
+        decision=decision_input.money_in_hand[0],
+    )
